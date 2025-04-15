@@ -29,5 +29,8 @@ class PermissionsMiddleware(MiddlewareMixin):
         if current_url_name == 'login' and not user.role.can_post_login:
             raise PermissionDenied("Vous n'avez pas la permission de vous connecter.")
         
+        if current_url_name == 'products_post' and not user.role.can_post_products:
+            raise PermissionDenied("Ce rôle n'a pas le droit d'ajouter un produit.")
+        
         return None
 

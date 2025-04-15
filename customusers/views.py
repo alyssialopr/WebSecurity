@@ -1,11 +1,18 @@
+import requests
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.permissions import BasePermission
 from .serializers import RegisterSerializer
 from django.contrib.auth.hashers import check_password
-from customusers.models import User, Role
+from customusers.models import User, Role, Product
 from customusers.authorizer import get_user_from_token
+from decouple import config
+import hmac
+import base64
+import hashlib
+import json
+
 
 import jwt
 from datetime import datetime, timedelta
@@ -76,3 +83,120 @@ class UserList(APIView):
             , status=status.HTTP_200_OK)
         except Exception as e:
             return Response({'detail': str(e)}, status=status.HTTP_401_UNAUTHORIZED)
+
+class ProductCreateView(APIView):
+    def post(self, request):
+        user = get_user_from_token(request)
+
+        name = request.data.get("name")
+        price = request.data.get("price")
+
+        if not name or not price:
+            return Response({'detail': "Nom et prix sont requis."}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Shopify config
+
+        SHOPIFY_API_KEY = config('SHOPIFY_API_KEY')
+        SHOPIFY_STORE = config('SHOPIFY_STORE')
+
+        url = f'https://{SHOPIFY_STORE}/admin/api/2023-01/products.json'
+        headers = {
+            'X-Shopify-Access-Token': SHOPIFY_API_KEY,
+            'Content-Type': 'application/json'
+        }
+
+        data = {
+            "product" : {
+                "title": name,
+                "variants" : [{
+                    "price" : price
+                }]
+            }
+        }
+
+        response = requests.post(url, headers=headers, json=data)
+
+        if response.status_code == 201:
+            product_data = response.json()['product']
+            shopify_id = str(product_data['id'])
+
+            # Enregistrement dans supabase
+            Product.objects.create(
+                shopify_id=shopify_id,
+                created_by=user
+            )
+            
+            return Response({"message": "Produit créé avec succès"}, status=status.HTTP_201_CREATED)
+        else:
+            return Response({"detail": "Erreur lors de la création du produit sur Shopify"}, status=status.HTTP_400_BAD_REQUEST)
+
+class MyProductsView(APIView):
+    def get(self, request):
+        user = get_user_from_token(request)
+        products = Product.objects.filter(created_by=user)
+
+        if not user:
+            return Response({'detail': "Utilisateur non trouvé."}, status=status.HTTP_404_NOT_FOUND)
+
+        return Response({
+            'products': [
+                {
+                    'shopify_id': p.shopify_id,
+                    'sales_count': p.sales_count
+                } for p in products
+            ]
+        }, status=status.HTTP_200_OK)
+
+class AllProductsView(APIView):
+
+    def get(self, request):
+        user = get_user_from_token(request)
+        products = Product.objects.all()
+
+        if not user:
+            return Response({'detail': "Utilisateur non trouvé."}, status=status.HTTP_404_NOT_FOUND)
+
+        return Response({
+            'products': [
+                {
+                    'shopify_id': p.shopify_id,
+                    'sales_count': p.sales_count,
+                    'created_by': p.created_by.name
+                } for p in products
+            ]
+        }, status=status.HTTP_200_OK)
+    
+class ShopifySalesWebhookView(APIView):
+    def post(self, request):
+        SHOPIFY_WEBHOOK_SECRET = config('SHOPIFY_WEBHOOK_SECRET')
+
+        # Vérification de la signature HMAC
+        hmac_header = request.headers.get('X-Shopify-Hmac-Sha256')
+        body = request.body
+
+        calculated_hmac = base64.b64encode(
+            hmac.new(
+               SHOPIFY_WEBHOOK_SECRET.encode('utf-8'),
+               body,
+               hashlib.sha256
+            ).digest()
+        ).decode('utf-8')
+
+        if not hmac.compare_digest(hmac_header, calculated_hmac):
+            return Response({'detail': 'Signature HMAC invalide'}, status=status.HTTP_403_FORBIDDEN)
+        
+        payload = json.loads(body)
+        line_items = payload.get('line_items', [])
+
+        for item in line_items:
+            shopify_product_id = str(item.get('product_id'))
+            quantity = int(item.get('quantity', 0))
+
+            try:
+                product = Product.objects.get(shopify_id=shopify_product_id)
+                product.sales_count += quantity
+                product.save()
+            except:
+                continue
+        
+        return Response({'detail': 'Webhook traité avec succès'}, status=status.HTTP_200_OK)
